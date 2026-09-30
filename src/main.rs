@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
+use lightdisks::app::App;
 use lightdisks::human_size;
 use lightdisks::scan;
 use lightdisks::tree::{Kind, Tree};
@@ -11,8 +12,42 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
         [flag, path] if flag == "--dump" => dump(Path::new(path)),
+        [flag, ..] if flag.starts_with('-') => {
+            eprintln!("usage: lightdisks [<folder>] | lightdisks --dump <folder>");
+            ExitCode::FAILURE
+        }
+        [path] => gui(Some(Path::new(path))),
+        [] => gui(None),
         _ => {
-            eprintln!("usage: lightdisks --dump <path>");
+            eprintln!("usage: lightdisks [<folder>] | lightdisks --dump <folder>");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn gui(path: Option<&Path>) -> ExitCode {
+    let path = match path.map(std::path::absolute).transpose() {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("lightdisks: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_title("lightdisks")
+            .with_inner_size([1280.0, 820.0]),
+        ..Default::default()
+    };
+    let result = eframe::run_native(
+        "lightdisks",
+        options,
+        Box::new(|cc| Ok(Box::new(App::new(cc, path)))),
+    );
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("lightdisks: {e}");
             ExitCode::FAILURE
         }
     }

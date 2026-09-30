@@ -117,7 +117,7 @@ pub fn scan(
     root: &Path,
     mut on_progress: impl FnMut(&Progress) -> ControlFlow<()>,
 ) -> Result<Tree, ScanError> {
-    let root_meta = fs::symlink_metadata(root).map_err(ScanError::Root)?;
+    let root_meta = fs::metadata(root).map_err(ScanError::Root)?;
     if !root_meta.is_dir() {
         return Err(ScanError::Root(io::Error::new(
             io::ErrorKind::NotADirectory,

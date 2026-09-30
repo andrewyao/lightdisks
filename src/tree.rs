@@ -115,6 +115,12 @@ impl Tree {
         path
     }
 
+    /// The child of `ancestor` on the path down to `id`, if `id` is below it.
+    pub fn child_toward(&self, ancestor: NodeId, id: NodeId) -> Option<NodeId> {
+        self.ancestors(id)
+            .find(|&a| self.node(a).parent == Some(ancestor))
+    }
+
     pub fn find_child(&self, id: NodeId, name: &str) -> Option<NodeId> {
         self.children(id).find(|&c| &*self.node(c).name == name)
     }
