@@ -157,9 +157,17 @@ impl eframe::App for App {
             egui::Panel::bottom("status").show(ui, |ui| model.status(ui));
             egui::Panel::right("legend")
                 .resizable(false)
-                .show(ui, |ui| match model.view {
-                    View::Folders { .. } => model.folder_list(ui),
-                    View::FileTypes => model.legend(ui),
+                .show(ui, |ui| {
+                    // Laid out first so the list's scroll area can't push it off.
+                    if !model.hidden.ids().is_empty() {
+                        egui::Panel::bottom("hidden")
+                            .resizable(false)
+                            .show(ui, |ui| model.hidden_list(ui));
+                    }
+                    match model.view {
+                        View::Folders { .. } => model.folder_list(ui),
+                        View::FileTypes => model.legend(ui),
+                    }
                 });
         }
 
@@ -295,7 +303,7 @@ impl Model {
                 Some(item) => {
                     let bytes = item.bytes(&self.tree, &self.hidden);
                     ui.label(RichText::new(human_size(bytes)).strong());
-                    let root_bytes = self.tree.node(self.root).size;
+                    let root_bytes = self.hidden.size(&self.tree, self.root);
                     if root_bytes > 0 && self.tree.is_within(item.node(), self.root) {
                         ui.label(format!("{:.1}%", 100.0 * bytes as f64 / root_bytes as f64));
                     }
@@ -308,7 +316,7 @@ impl Model {
                 None => {
                     ui.label(format!(
                         "{} total",
-                        human_size(self.tree.node(self.root).size)
+                        human_size(self.hidden.size(&self.tree, self.root))
                     ));
                 }
             }
@@ -342,7 +350,7 @@ impl Model {
         ui.heading(&*self.tree.node(self.root).name);
         ui.add_space(4.0);
         let hues = top_hues(&self.tree, &self.hidden, self.root);
-        let root_bytes = self.tree.node(self.root).size.max(1);
+        let root_bytes = self.hidden.size(&self.tree, self.root).max(1);
         egui::ScrollArea::vertical().show(ui, |ui| {
             egui::Grid::new("folders")
                 .num_columns(4)
@@ -355,13 +363,8 @@ impl Model {
                         };
                         swatch(ui, fill);
                         let name = self.item_name(item);
-                        let short: String = if name.chars().count() > 28 {
-                            name.chars().take(27).chain(['…']).collect()
-                        } else {
-                            name.into()
-                        };
                         let row = ui
-                            .selectable_label(self.selected == Some(item), short)
+                            .selectable_label(self.selected == Some(item), shorten(name))
                             .on_hover_text(name);
                         if row.clicked() {
                             self.selected = Some(item);
@@ -372,6 +375,41 @@ impl Model {
                     }
                 });
         });
+    }
+
+    fn hidden_list(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(4.0);
+        ui.heading("Hidden");
+        ui.add_space(4.0);
+        let mut restore = Vec::new();
+        egui::ScrollArea::vertical()
+            .max_height(160.0)
+            .show(ui, |ui| {
+                egui::Grid::new("hidden")
+                    .num_columns(3)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for &id in self.hidden.ids() {
+                            let node = self.tree.node(id);
+                            ui.label(shorten(&node.name))
+                                .on_hover_text(self.tree.path(id).display().to_string());
+                            ui.label(human_size(node.size));
+                            if ui.button("Restore").clicked() {
+                                restore.push(id);
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+        if self.hidden.ids().len() >= 2 && ui.button("Restore all").clicked() {
+            restore = self.hidden.ids().to_vec();
+        }
+        if !restore.is_empty() {
+            for id in restore {
+                self.hidden.restore(&self.tree, id);
+            }
+            self.revision += 1;
+        }
     }
 
     fn treemap(&mut self, ui: &mut egui::Ui) {
@@ -505,6 +543,19 @@ impl Model {
                 }
                 ui.close();
             }
+            let hide = ui.add_enabled(
+                matches!(item, Item::Node(id) if self.tree.is_dir(id)),
+                egui::Button::new("Hide"),
+            );
+            if hide.clicked() {
+                let id = item.node();
+                self.hidden.hide(&self.tree, id);
+                self.revision += 1;
+                let shown = |i: Option<Item>| i.filter(|i| !self.tree.is_within(i.node(), id));
+                self.selected = shown(self.selected);
+                self.hovered = shown(self.hovered);
+                ui.close();
+            }
             let trash = ui.add_enabled(
                 matches!(item, Item::Node(_)),
                 egui::Button::new("Move to Trash…"),
@@ -602,6 +653,7 @@ impl Model {
         match trash::delete(&path) {
             Ok(()) => {
                 self.tree.remove(target);
+                self.hidden.sync(&self.tree);
                 self.revision += 1;
                 self.selected = self.selected.and_then(|sel| match sel {
                     _ if self.tree.is_within(sel.node(), target) => None,
@@ -714,4 +766,12 @@ fn legend_row(ui: &mut egui::Ui, color: Rgb, name: &str, bytes: u64) {
     ui.label(name);
     ui.label(human_size(bytes));
     ui.end_row();
+}
+
+fn shorten(name: &str) -> String {
+    if name.chars().count() > 28 {
+        name.chars().take(27).chain(['…']).collect()
+    } else {
+        name.into()
+    }
 }
