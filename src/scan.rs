@@ -57,9 +57,9 @@ enum Stat {
     Unreadable,
     Walk(Meta),
     /// Opening directories inside other apps' sandbox containers from several
-    /// threads at once intermittently stalls for exactly 5s in macOS's access
-    /// check, while serial opens never do, so these subtrees are read from the
-    /// single consumer thread.
+    /// threads at once intermittently stalls for exactly 5s (seen on macOS 26),
+    /// while serial opens never did, so these subtrees are read from the single
+    /// consumer thread.
     WalkSerially(Meta),
 }
 

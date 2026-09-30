@@ -74,11 +74,7 @@ fn lay_children(
     let px_per_byte = rect.area() as f64 / total as f64;
     let min_area = (min_px * min_px) as f64;
 
-    let mut kids: Vec<(NodeId, u64)> = tree
-        .children(dir)
-        .map(|c| (c, tree.node(c).size))
-        .filter(|&(_, size)| size > 0)
-        .collect();
+    let mut kids: Vec<(NodeId, u64)> = tree.children(dir).map(|c| (c, tree.node(c).size)).collect();
     // Trashing shrinks ancestors after the scan sorted them, so re-sort here.
     kids.sort_by_key(|&(_, size)| Reverse(size));
     let visible = kids.partition_point(|&(_, size)| size as f64 * px_per_byte >= min_area);
