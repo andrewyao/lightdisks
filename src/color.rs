@@ -70,7 +70,7 @@ pub fn folder_hue(rank: usize) -> Rgb {
 /// A folder tile's fill: dark at the top level and lighter at each depth, so a
 /// folder's header stands apart from the children drawn over it.
 pub fn folder_fill(hue: Rgb, depth: u8) -> Rgb {
-    shade(hue, -0.45 + 0.2 * (depth.max(1) - 1) as f32)
+    shade(hue, -0.3 + 0.18 * (depth.max(1) - 1) as f32)
 }
 
 /// A `(files)` tile's fill: a muted grey of its folder's hue, or plain grey
