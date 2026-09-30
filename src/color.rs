@@ -61,3 +61,45 @@ impl Palette {
         }
     }
 }
+
+/// The hue of the `rank`-th largest top-level folder in folder view.
+pub fn folder_hue(rank: usize) -> Rgb {
+    HUES[rank % DISTINCT]
+}
+
+/// A folder tile's fill: dark at the top level and lighter at each depth, so a
+/// folder's header stands apart from the children drawn over it.
+pub fn folder_fill(hue: Rgb, depth: u8) -> Rgb {
+    shade(hue, -0.45 + 0.2 * (depth.max(1) - 1) as f32)
+}
+
+/// A `(files)` tile's fill: a muted grey of its folder's hue, or plain grey
+/// when the files sit directly in the view root.
+pub fn files_fill(hue: Option<Rgb>, depth: u8) -> Rgb {
+    let Some(hue) = hue else {
+        return shade(OTHER, -0.3);
+    };
+    let grey = luma(hue);
+    let muted = hue.map(|c| (grey * 0.75 + c as f32 * 0.25) as u8);
+    folder_fill(muted, depth)
+}
+
+/// Black or white, whichever reads better on `fill`.
+pub fn ink(fill: Rgb) -> Rgb {
+    if luma(fill) > 150.0 {
+        [16, 16, 18]
+    } else {
+        [255, 255, 255]
+    }
+}
+
+fn luma(c: Rgb) -> f32 {
+    0.299 * c[0] as f32 + 0.587 * c[1] as f32 + 0.114 * c[2] as f32
+}
+
+/// Mixes toward black for negative `amount` and toward white for positive.
+fn shade(c: Rgb, amount: f32) -> Rgb {
+    let target = if amount < 0.0 { 0.0 } else { 255.0 };
+    let t = amount.abs().min(1.0);
+    c.map(|v| (v as f32 + (target - v as f32) * t).round() as u8)
+}
