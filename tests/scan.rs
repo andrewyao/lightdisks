@@ -199,3 +199,50 @@ fn child_toward_finds_the_zoom_target() {
     assert_eq!(tree.child_toward(sub, sub), None);
     assert_eq!(tree.child_toward(nested, sub), None);
 }
+
+#[test]
+fn directory_larger_than_one_read_buffer_is_fully_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut expected = 0;
+    for i in 0..5000 {
+        let path = dir
+            .path()
+            .join(format!("file-with-a-longish-name-{i:05}.dat"));
+        write(&path, 1 + i % 7000);
+        expected += allocated(&path);
+    }
+    let tree = scan::scan(dir.path(), |_| ControlFlow::Continue(())).unwrap();
+    assert_eq!(tree.children(Tree::ROOT).count(), 5000);
+    assert_eq!(tree.node(Tree::ROOT).size, expected);
+    assert_eq!(tree.errors, 0);
+    let last = child(&tree, Tree::ROOT, "file-with-a-longish-name-04999.dat");
+    assert_eq!(
+        tree.node(last).size,
+        allocated(&dir.path().join("file-with-a-longish-name-04999.dat"))
+    );
+}
+
+#[test]
+fn long_unicode_names_survive_intact() {
+    let dir = tempfile::tempdir().unwrap();
+    let long = format!("{}.txt", "ü漢字🦀".repeat(20));
+    assert!(long.len() > 200 && long.len() <= 255, "{}", long.len());
+    let sub = "Ωmega dir ✓";
+    write(&dir.path().join(sub).join(&long), 9_000);
+    write(&dir.path().join("a"), 1);
+    let tree = scan::scan(dir.path(), |_| ControlFlow::Continue(())).unwrap();
+    let sub_id = child(&tree, Tree::ROOT, sub);
+    let file = child(&tree, sub_id, &long);
+    assert_eq!(
+        tree.node(file).size,
+        allocated(&dir.path().join(sub).join(&long))
+    );
+    assert_eq!(
+        tree.exts.index.get("txt"),
+        Some(&match tree.node(file).kind {
+            Kind::File { ext } => ext,
+            _ => panic!("{long} should be a file"),
+        })
+    );
+    assert!(tree.find_child(Tree::ROOT, "a").is_some());
+}
