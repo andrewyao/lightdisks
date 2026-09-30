@@ -116,6 +116,7 @@ pub fn scan(
         next: AtomicU32::new(1),
         tx,
         cancelled: AtomicBool::new(false),
+        containers: Mutex::new(()),
     };
     let mut builder = Builder {
         raws: vec![Raw {
@@ -162,6 +163,11 @@ struct Walker {
     next: AtomicU32,
     tx: Sender<Batch>,
     cancelled: AtomicBool,
+    /// Held while reading inside another app's sandbox container. Each such
+    /// open waits on sandboxd for approval, and one sometimes stalls for
+    /// exactly 5s (macOS 26). Reading them one at a time makes that rare:
+    /// 1 in 75 ~/Library scans, against 14 in 15 with no limit.
+    containers: Mutex<()>,
 }
 
 impl Walker {
@@ -207,6 +213,7 @@ impl Walker {
 
     /// Appends `dir`'s entries and returns how many things could not be read.
     fn read(&self, dir: &Path, is_root: bool, entries: &mut Vec<bulk::Entry>) -> u64 {
+        let _one_at_a_time = in_container(dir).then(|| self.containers.lock().unwrap());
         // The root may be a symlink the user named; everything below is not.
         let opened = if is_root {
             File::open(dir)
@@ -224,6 +231,13 @@ impl Walker {
         e.dev == self.dev
             && (e.kind != bulk::EntryKind::Dir || self.dirs.lock().unwrap().insert((e.dev, e.ino)))
     }
+}
+
+const SANDBOX_PARENTS: [&str; 2] = ["Containers", "Group Containers"];
+
+fn in_container(dir: &Path) -> bool {
+    dir.parent()
+        .is_some_and(|p| p.iter().any(|c| SANDBOX_PARENTS.iter().any(|s| c == *s)))
 }
 
 struct Builder<'a> {
