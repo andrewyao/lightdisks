@@ -1,8 +1,6 @@
 use std::path::PathBuf;
 
-use lightdisks::layout::{
-    FOLDER_PAD, FolderTile, Item, Rect, folders, items, layout, squarify,
-};
+use lightdisks::layout::{FOLDER_PAD, FolderTile, Item, Rect, folders, items, layout, squarify};
 use lightdisks::tree::{ExtTable, Kind, Node, NodeId, Tree};
 
 fn rect(w: f32, h: f32) -> Rect {
@@ -220,7 +218,12 @@ fn build(spec: Spec) -> Tree {
                 next += kids.len() as u32;
                 let id = nodes.len() as u32;
                 queue.extend(kids.into_iter().map(|k| (k, Some(id))));
-                (name, Kind::Dir { children: start..next })
+                (
+                    name,
+                    Kind::Dir {
+                        children: start..next,
+                    },
+                )
             }
             Spec::File(name, _) => {
                 exts.bytes[ext.0 as usize] += size;
@@ -422,10 +425,18 @@ fn a_files_tile_appears_exactly_when_a_folder_has_direct_files() {
         let expected = (direct > 0).then_some(direct);
         assert_eq!(files_of(dir), expected, "{}", tree.path(dir).display());
     }
-    assert_eq!(files_of(id(&tree, "big")), Some(200_000), "file plus symlink");
+    assert_eq!(
+        files_of(id(&tree, "big")),
+        Some(200_000),
+        "file plus symlink"
+    );
     assert_eq!(files_of(Tree::ROOT), Some(200_000));
     assert_eq!(files_of(id(&tree, "dirs_only")), None);
-    assert_eq!(files_of(id(&tree, "solo")), None, "its only file was trashed");
+    assert_eq!(
+        files_of(id(&tree, "solo")),
+        None,
+        "its only file was trashed"
+    );
 }
 
 #[test]
