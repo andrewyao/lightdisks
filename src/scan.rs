@@ -1,17 +1,18 @@
 use std::cmp::Reverse;
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fmt;
-use std::fs;
+use std::fs::{self, File};
 use std::io;
 use std::ops::ControlFlow;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
-
-use jwalk::{Parallelism, WalkDirGeneric};
 
 use crate::tree::{ExtId, ExtTable, Kind, Node, NodeId, Tree, extension_of};
 
@@ -46,35 +47,6 @@ impl fmt::Display for ScanError {
     }
 }
 
-/// What a directory reader learned about one entry.
-#[derive(Debug, Default)]
-enum Stat {
-    /// Not counted: on another device, or a directory already reached by another
-    /// path (macOS firmlinks expose the Data volume at both `/Users` and
-    /// `/System/Volumes/Data/Users`).
-    #[default]
-    Skip,
-    Unreadable,
-    Walk(Meta),
-    /// Opening directories inside other apps' sandbox containers from several
-    /// threads at once intermittently stalls for exactly 5s (seen on macOS 26),
-    /// while serial opens never did, so these subtrees are read from the single
-    /// consumer thread.
-    WalkSerially(Meta),
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Meta {
-    is_dir: bool,
-    is_file: bool,
-    bytes: u64,
-    dev: u64,
-    ino: u64,
-    nlink: u64,
-}
-
-const SANDBOX_PARENTS: [&str; 2] = ["Containers", "Group Containers"];
-
 enum RawKind {
     Dir,
     File(ExtId),
@@ -86,6 +58,16 @@ struct Raw {
     parent: u32,
     size: u64,
     kind: RawKind,
+}
+
+/// One directory's counted entries, already assigned the raw indices
+/// `first..first + entries.len()`.
+struct Batch {
+    dir: PathBuf,
+    parent: u32,
+    first: u32,
+    entries: Vec<bulk::Entry>,
+    errors: u64,
 }
 
 /// Scans in a background thread. The receiver gets throttled progress, then
@@ -124,39 +106,17 @@ pub fn scan(
             "not a directory",
         )));
     }
-    let seen = Arc::new(Seen {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .build()
+        .map_err(|e| ScanError::Root(io::Error::other(e)))?;
+    let (tx, rx) = mpsc::channel();
+    let walker = Walker {
         dev: root_meta.dev(),
         dirs: Mutex::new(HashSet::from([(root_meta.dev(), root_meta.ino())])),
-    });
-
-    let reader_seen = Arc::clone(&seen);
-    let walk = WalkDirGeneric::<((), Stat)>::new(root)
-        .skip_hidden(false)
-        .follow_links(false)
-        .parallelism(Parallelism::RayonNewPool(0))
-        .process_read_dir(move |depth, dir, _, children| {
-            // jwalk passes the root entry itself through here with no depth.
-            if depth.is_none() {
-                return;
-            }
-            let sandboxed = dir
-                .file_name()
-                .is_some_and(|n| SANDBOX_PARENTS.iter().any(|s| n == *s));
-            for entry in children.iter_mut().flatten() {
-                entry.client_state = match fs::symlink_metadata(dir.join(&entry.file_name)) {
-                    Err(_) => Stat::Unreadable,
-                    Ok(meta) => match reader_seen.classify(&meta) {
-                        None => Stat::Skip,
-                        Some(meta) if meta.is_dir && sandboxed => Stat::WalkSerially(meta),
-                        Some(meta) => Stat::Walk(meta),
-                    },
-                };
-                if !matches!(entry.client_state, Stat::Walk(_)) {
-                    entry.read_children = None;
-                }
-            }
-        });
-
+        next: AtomicU32::new(1),
+        tx,
+        cancelled: AtomicBool::new(false),
+    };
     let mut builder = Builder {
         raws: vec![Raw {
             name: root.to_string_lossy().into(),
@@ -170,43 +130,20 @@ pub fn scan(
         last_report: Instant::now(),
         on_progress: &mut on_progress,
     };
-    // stack[d] is the raw index of the directory currently open at depth d.
-    let mut stack: Vec<u32> = vec![0];
 
-    for item in walk {
-        let Ok(entry) = item else {
-            builder.progress.errors += 1;
-            continue;
-        };
-        if entry.depth == 0 {
-            continue;
+    thread::scope(|s| {
+        s.spawn(|| {
+            // The walker, and with it the last sender, drops once every
+            // directory is read, which ends the loop below.
+            let walker = walker;
+            pool.scope(|scope| walker.walk(scope, root.to_path_buf(), 0));
+        });
+        // Returning early drops `rx`, so the walker's next send fails and it stops.
+        for batch in rx {
+            builder.add(batch)?;
         }
-        if entry
-            .read_children
-            .as_ref()
-            .is_some_and(|rc| rc.error().is_some())
-        {
-            builder.progress.errors += 1;
-        }
-        stack.truncate(entry.depth);
-        let parent = stack[entry.depth - 1];
-        let name = entry.file_name.to_string_lossy();
-        match entry.client_state {
-            Stat::Skip => {}
-            Stat::Unreadable => builder.progress.errors += 1,
-            Stat::Walk(meta) => {
-                let index = builder.add(parent, &name, meta, || entry.path())?;
-                if meta.is_dir {
-                    stack.push(index);
-                }
-            }
-            Stat::WalkSerially(meta) => {
-                let path = entry.path();
-                let index = builder.add(parent, &name, meta, || path.clone())?;
-                builder.walk_serially(&path, index, &seen)?;
-            }
-        }
-    }
+        Ok(())
+    })?;
 
     let errors = builder.progress.errors;
     Ok(build(
@@ -217,26 +154,75 @@ pub fn scan(
     ))
 }
 
-struct Seen {
+struct Walker {
     dev: u64,
+    /// Directories already queued. macOS firmlinks expose the Data volume at
+    /// both `/Users` and `/System/Volumes/Data/Users`.
     dirs: Mutex<HashSet<(u64, u64)>>,
+    next: AtomicU32,
+    tx: Sender<Batch>,
+    cancelled: AtomicBool,
 }
 
-impl Seen {
-    /// The entry's accounting facts, or `None` when it must not be counted.
-    fn classify(&self, meta: &fs::Metadata) -> Option<Meta> {
-        let (dev, ino) = (meta.dev(), meta.ino());
-        if dev != self.dev || (meta.is_dir() && !self.dirs.lock().unwrap().insert((dev, ino))) {
-            return None;
+impl Walker {
+    /// Reads `dir`, whose raw index is `index`, reserves indices for the
+    /// entries it counts, and queues its subdirectories. A child's index is
+    /// reserved after its parent's, so parent < child for `build`.
+    fn walk<'s>(&'s self, scope: &rayon::Scope<'s>, dir: PathBuf, index: u32) {
+        if self.cancelled.load(Relaxed) {
+            return;
         }
-        Some(Meta {
-            is_dir: meta.is_dir(),
-            is_file: meta.is_file(),
-            bytes: meta.blocks() * 512,
-            dev,
-            ino,
-            nlink: meta.nlink(),
-        })
+        let mut entries = Vec::new();
+        let errors = self.read(&dir, index == 0, &mut entries);
+        for e in entries.iter_mut().filter(|e| e.redirects) {
+            // Rare, so one lstat each finds the identity of what it reaches.
+            let path = dir.join(OsStr::from_bytes(&e.name));
+            if let Ok(meta) = fs::symlink_metadata(path) {
+                (e.dev, e.ino) = (meta.dev(), meta.ino());
+            }
+        }
+        entries.retain(|e| self.counts(e));
+        let first = self.next.fetch_add(entries.len() as u32, Relaxed);
+        let subdirs: Vec<(PathBuf, u32)> = entries
+            .iter()
+            .zip(first..)
+            .filter(|(e, _)| e.kind == bulk::EntryKind::Dir)
+            .map(|(e, i)| (dir.join(OsStr::from_bytes(&e.name)), i))
+            .collect();
+        let batch = Batch {
+            dir,
+            parent: index,
+            first,
+            entries,
+            errors,
+        };
+        if self.tx.send(batch).is_err() {
+            self.cancelled.store(true, Relaxed);
+            return;
+        }
+        for (path, i) in subdirs {
+            scope.spawn(move |scope| self.walk(scope, path, i));
+        }
+    }
+
+    /// Appends `dir`'s entries and returns how many things could not be read.
+    fn read(&self, dir: &Path, is_root: bool, entries: &mut Vec<bulk::Entry>) -> u64 {
+        // The root may be a symlink the user named; everything below is not.
+        let opened = if is_root {
+            File::open(dir)
+        } else {
+            bulk::open_dir(dir)
+        };
+        opened
+            .and_then(|file| bulk::read_dir(&file, entries))
+            .unwrap_or(1)
+    }
+
+    /// Whether an entry is on the scanned device and not a directory already
+    /// reached by another path.
+    fn counts(&self, e: &bulk::Entry) -> bool {
+        e.dev == self.dev
+            && (e.kind != bulk::EntryKind::Dir || self.dirs.lock().unwrap().insert((e.dev, e.ino)))
     }
 }
 
@@ -250,71 +236,50 @@ struct Builder<'a> {
 }
 
 impl Builder<'_> {
-    fn add(
-        &mut self,
-        parent: u32,
-        name: &str,
-        meta: Meta,
-        path: impl FnOnce() -> PathBuf,
-    ) -> Result<u32, ScanError> {
-        let size = if meta.is_dir || (meta.nlink > 1 && !self.linked.insert((meta.dev, meta.ino))) {
-            0
-        } else {
-            meta.bytes
-        };
-        let kind = if meta.is_dir {
-            RawKind::Dir
-        } else if meta.is_file {
-            let ext = self.exts.intern(&extension_of(name));
-            self.exts.bytes[ext.0 as usize] += size;
-            RawKind::File(ext)
-        } else {
-            RawKind::Other
-        };
-        let index = self.raws.len() as u32;
-        self.raws.push(Raw {
-            name: name.into(),
-            parent,
-            size,
-            kind,
-        });
+    fn add(&mut self, batch: Batch) -> Result<(), ScanError> {
+        let first = batch.first as usize;
+        let end = first + batch.entries.len();
+        if self.raws.len() < end {
+            self.raws.resize_with(end, || Raw {
+                name: "".into(),
+                parent: 0,
+                size: 0,
+                kind: RawKind::Other,
+            });
+        }
+        for (i, e) in (first..end).zip(batch.entries) {
+            let size = match e.kind {
+                bulk::EntryKind::Dir => 0,
+                _ if e.nlink > 1 && !self.linked.insert((e.dev, e.ino)) => 0,
+                _ => e.alloc,
+            };
+            let name = String::from_utf8(e.name)
+                .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned());
+            let kind = match e.kind {
+                bulk::EntryKind::Dir => RawKind::Dir,
+                bulk::EntryKind::File => {
+                    let ext = self.exts.intern(&extension_of(&name));
+                    self.exts.bytes[ext.0 as usize] += size;
+                    RawKind::File(ext)
+                }
+                bulk::EntryKind::Other => RawKind::Other,
+            };
+            self.raws[i] = Raw {
+                name: name.into_boxed_str(),
+                parent: batch.parent,
+                size,
+                kind,
+            };
+            self.progress.bytes += size;
+        }
+        self.progress.entries += (end - first) as u64;
+        self.progress.errors += batch.errors;
 
-        self.progress.entries += 1;
-        self.progress.bytes += size;
-        if self.progress.entries.is_multiple_of(1024)
-            && self.last_report.elapsed() >= PROGRESS_INTERVAL
-        {
+        if self.last_report.elapsed() >= PROGRESS_INTERVAL {
             self.last_report = Instant::now();
-            self.progress.current = path();
+            self.progress.current = batch.dir;
             if (self.on_progress)(&self.progress).is_break() {
                 return Err(ScanError::Cancelled);
-            }
-        }
-        Ok(index)
-    }
-
-    fn walk_serially(&mut self, dir: &Path, parent: u32, seen: &Seen) -> Result<(), ScanError> {
-        let Ok(read_dir) = fs::read_dir(dir) else {
-            self.progress.errors += 1;
-            return Ok(());
-        };
-        for entry in read_dir {
-            let Ok(entry) = entry else {
-                self.progress.errors += 1;
-                continue;
-            };
-            let path = entry.path();
-            let Ok(meta) = fs::symlink_metadata(&path) else {
-                self.progress.errors += 1;
-                continue;
-            };
-            let Some(meta) = seen.classify(&meta) else {
-                continue;
-            };
-            let name = entry.file_name();
-            let index = self.add(parent, &name.to_string_lossy(), meta, || path.clone())?;
-            if meta.is_dir {
-                self.walk_serially(&path, index, seen)?;
             }
         }
         Ok(())
@@ -390,5 +355,234 @@ fn build(mut raws: Vec<Raw>, exts: ExtTable, root_path: PathBuf, errors: u64) ->
         exts,
         root_path,
         errors,
+    }
+}
+
+/// The only code that touches getattrlistbulk(2). Its packed reply is parsed
+/// into owned `Entry` values here, with every read bounds-checked.
+mod bulk {
+    use std::cell::RefCell;
+    use std::fs::{File, OpenOptions};
+    use std::io;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::Path;
+
+    use libc::{
+        ATTR_BIT_MAP_COUNT, ATTR_CMN_DEVID, ATTR_CMN_FILEID, ATTR_CMN_FLAGS, ATTR_CMN_NAME,
+        ATTR_CMN_OBJTYPE, ATTR_CMN_RETURNED_ATTRS, ATTR_DIR_MOUNTSTATUS, ATTR_FILE_ALLOCSIZE,
+        ATTR_FILE_LINKCOUNT, DIR_MNTSTATUS_MNTPOINT, FSOPT_PACK_INVAL_ATTRS,
+    };
+
+    /// <sys/attr.h>; libc does not export it.
+    const ATTR_CMN_ERROR: u32 = 0x2000_0000;
+    /// <sys/stat.h>; libc does not export it.
+    const SF_FIRMLINK: u32 = 0x0080_0000;
+    /// `enum vtype` in <sys/vnode.h>.
+    const VREG: u32 = 1;
+    const VDIR: u32 = 2;
+
+    const COMMON: u32 = ATTR_CMN_RETURNED_ATTRS
+        | ATTR_CMN_NAME
+        | ATTR_CMN_ERROR
+        | ATTR_CMN_DEVID
+        | ATTR_CMN_OBJTYPE
+        | ATTR_CMN_FLAGS
+        | ATTR_CMN_FILEID;
+    const REQUIRED: u32 = ATTR_CMN_NAME | ATTR_CMN_DEVID | ATTR_CMN_OBJTYPE | ATTR_CMN_FILEID;
+    const FILE: u32 = ATTR_FILE_LINKCOUNT | ATTR_FILE_ALLOCSIZE;
+    const BUF_LEN: usize = 256 * 1024;
+
+    thread_local! {
+        static BUF: RefCell<Vec<u8>> = RefCell::new(vec![0; BUF_LEN]);
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum EntryKind {
+        Dir,
+        File,
+        Other,
+    }
+
+    #[derive(Debug)]
+    pub struct Entry {
+        pub name: Vec<u8>,
+        pub kind: EntryKind,
+        pub dev: u64,
+        pub ino: u64,
+        pub nlink: u64,
+        /// Allocated bytes; zero for directories.
+        pub alloc: u64,
+        /// A firmlink or a mount point. `dev` and `ino` describe the entry
+        /// itself, not the directory that opening it reaches.
+        pub redirects: bool,
+    }
+
+    pub fn open_dir(path: &Path) -> io::Result<File> {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)
+    }
+
+    /// Appends the entries of the open directory `dir` to `out` and returns
+    /// how many entries the kernel could not describe.
+    pub fn read_dir(dir: &File, out: &mut Vec<Entry>) -> io::Result<u64> {
+        BUF.with_borrow_mut(|buf| {
+            let mut unreadable = 0;
+            loop {
+                let count = fill(dir, buf)?;
+                if count == 0 {
+                    return Ok(unreadable);
+                }
+                let mut rest = &buf[..];
+                for _ in 0..count {
+                    let len = Fields::new(rest).u32()? as usize;
+                    if len < 4 || len > rest.len() {
+                        return Err(malformed());
+                    }
+                    let (record, tail) = rest.split_at(len);
+                    rest = tail;
+                    match parse(record)? {
+                        Some(entry) => out.push(entry),
+                        None => unreadable += 1,
+                    }
+                }
+            }
+        })
+    }
+
+    fn fill(dir: &File, buf: &mut [u8]) -> io::Result<usize> {
+        let mut list = libc::attrlist {
+            bitmapcount: ATTR_BIT_MAP_COUNT,
+            reserved: 0,
+            commonattr: COMMON,
+            volattr: 0,
+            dirattr: ATTR_DIR_MOUNTSTATUS,
+            fileattr: FILE,
+            forkattr: 0,
+        };
+        // SAFETY: `list` and `buf` outlive the call, and the kernel writes at
+        // most `buf.len()` bytes into `buf`.
+        let n = unsafe {
+            libc::getattrlistbulk(
+                dir.as_raw_fd(),
+                (&raw mut list).cast(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                FSOPT_PACK_INVAL_ATTRS as u64,
+            )
+        };
+        usize::try_from(n).map_err(|_| io::Error::last_os_error())
+    }
+
+    /// One record: its length, the returned attribute_set_t, the error slot,
+    /// the common attributes in bit order, then the directory group for a
+    /// directory or the file group for anything else. This order was observed
+    /// on macOS 26: the error slot sits before the name, and
+    /// FSOPT_PACK_INVAL_ATTRS keeps it present with no error but packs only
+    /// the group matching the object's type.
+    /// `None` is an entry the kernel reported an error for.
+    fn parse(record: &[u8]) -> io::Result<Option<Entry>> {
+        let mut f = Fields::new(record);
+        f.u32()?;
+        let returned_common = f.u32()?;
+        let _returned_vol = f.u32()?;
+        let returned_dir = f.u32()?;
+        let returned_file = f.u32()?;
+        let _returned_fork = f.u32()?;
+        let error = f.u32()?;
+        let name_ref = f.at;
+        let name_offset = f.i32()?;
+        let name_len = f.u32()?;
+        let dev = f.i32()?;
+        let objtype = f.u32()?;
+        let flags = f.u32()?;
+        let ino = f.u64()?;
+
+        if (returned_common & ATTR_CMN_ERROR != 0 && error != 0)
+            || returned_common & REQUIRED != REQUIRED
+        {
+            return Ok(None);
+        }
+        let name = (name_ref as i64)
+            .checked_add(name_offset.into())
+            .and_then(|start| usize::try_from(start).ok())
+            .and_then(|start| record.get(start..start.checked_add(name_len as usize)?))
+            .ok_or_else(malformed)?;
+        let name = name.split(|&b| b == 0).next().unwrap_or_default();
+        let kind = match objtype {
+            VDIR => EntryKind::Dir,
+            VREG => EntryKind::File,
+            _ => EntryKind::Other,
+        };
+        let (mut nlink, mut alloc, mut redirects) = (1, 0, false);
+        if kind == EntryKind::Dir {
+            let status = f.u32()?;
+            redirects = (returned_dir & ATTR_DIR_MOUNTSTATUS != 0
+                && status & DIR_MNTSTATUS_MNTPOINT != 0)
+                || (returned_common & ATTR_CMN_FLAGS != 0 && flags & SF_FIRMLINK != 0);
+        }
+        if kind != EntryKind::Dir {
+            let (count, size) = (f.u32()?, f.i64()?);
+            if returned_file & ATTR_FILE_LINKCOUNT != 0 {
+                nlink = count.into();
+            }
+            if returned_file & ATTR_FILE_ALLOCSIZE != 0 {
+                alloc = size.max(0) as u64;
+            }
+        }
+        Ok(Some(Entry {
+            name: name.to_vec(),
+            kind,
+            dev: dev as u64,
+            ino,
+            nlink,
+            alloc,
+            redirects,
+        }))
+    }
+
+    fn malformed() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "malformed getattrlistbulk record",
+        )
+    }
+
+    struct Fields<'a> {
+        record: &'a [u8],
+        at: usize,
+    }
+
+    impl<'a> Fields<'a> {
+        fn new(record: &'a [u8]) -> Self {
+            Fields { record, at: 0 }
+        }
+
+        fn take<const N: usize>(&mut self) -> io::Result<[u8; N]> {
+            let bytes = self
+                .record
+                .get(self.at..self.at + N)
+                .ok_or_else(malformed)?;
+            self.at += N;
+            Ok(bytes.try_into().unwrap())
+        }
+
+        fn u32(&mut self) -> io::Result<u32> {
+            self.take().map(u32::from_ne_bytes)
+        }
+
+        fn i32(&mut self) -> io::Result<i32> {
+            self.take().map(i32::from_ne_bytes)
+        }
+
+        fn u64(&mut self) -> io::Result<u64> {
+            self.take().map(u64::from_ne_bytes)
+        }
+
+        fn i64(&mut self) -> io::Result<i64> {
+            self.take().map(i64::from_ne_bytes)
+        }
     }
 }
