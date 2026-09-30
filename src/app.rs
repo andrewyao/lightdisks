@@ -9,6 +9,7 @@ use eframe::egui::{
 };
 
 use crate::color::{self, OTHER, Palette, Rgb};
+use crate::hidden::Hidden;
 use crate::human_size;
 use crate::layout::{self, FolderTile, Item, Rect, Tile};
 use crate::render::{self, Raster};
@@ -48,7 +49,8 @@ pub struct Model {
     confirm_trash: Option<NodeId>,
     notice: Option<String>,
     palette: Palette,
-    /// Bumped whenever the tree changes, so the cached layout is rebuilt.
+    hidden: Hidden,
+    /// Bumped whenever the tree or `hidden` changes, so the cached layout is rebuilt.
     revision: u64,
     layout: Option<LayoutCache>,
 }
@@ -227,6 +229,7 @@ impl Model {
             hovered: None,
             confirm_trash: None,
             notice: None,
+            hidden: Hidden::default(),
             revision: 0,
             layout: None,
         }
@@ -290,7 +293,7 @@ impl Model {
             }
             match self.hovered.or(self.selected) {
                 Some(item) => {
-                    let bytes = item.bytes(&self.tree);
+                    let bytes = item.bytes(&self.tree, &self.hidden);
                     ui.label(RichText::new(human_size(bytes)).strong());
                     let root_bytes = self.tree.node(self.root).size;
                     if root_bytes > 0 && self.tree.is_within(item.node(), self.root) {
@@ -338,14 +341,14 @@ impl Model {
     fn folder_list(&mut self, ui: &mut egui::Ui) {
         ui.heading(&*self.tree.node(self.root).name);
         ui.add_space(4.0);
-        let hues = top_hues(&self.tree, self.root);
+        let hues = top_hues(&self.tree, &self.hidden, self.root);
         let root_bytes = self.tree.node(self.root).size.max(1);
         egui::ScrollArea::vertical().show(ui, |ui| {
             egui::Grid::new("folders")
                 .num_columns(4)
                 .striped(true)
                 .show(ui, |ui| {
-                    for (item, bytes) in layout::items(&self.tree, self.root) {
+                    for (item, bytes) in layout::items(&self.tree, &self.hidden, self.root) {
                         let fill = match item {
                             Item::Node(id) => color::folder_fill(hues[&id], 1),
                             Item::Files { .. } => color::files_fill(None, 1),
@@ -407,7 +410,7 @@ impl Model {
                         to_screen,
                         fill,
                         name,
-                        tile.item.bytes(&self.tree),
+                        tile.item.bytes(&self.tree, &self.hidden),
                     );
                 }
                 let hovered = pointer.and_then(|p| {
@@ -533,8 +536,15 @@ impl Model {
                     w: points.x,
                     h: points.y,
                 };
-                let tiles = layout::folders(&self.tree, key.root, rect, depth, MIN_FOLDER_PT);
-                let fills = folder_fills(&self.tree, key.root, &tiles);
+                let tiles = layout::folders(
+                    &self.tree,
+                    &self.hidden,
+                    key.root,
+                    rect,
+                    depth,
+                    MIN_FOLDER_PT,
+                );
+                let fills = folder_fills(&self.tree, &self.hidden, key.root, &tiles);
                 Drawn::Folders { tiles, fills }
             }
             View::FileTypes => {
@@ -545,7 +555,7 @@ impl Model {
                     w: w as f32,
                     h: h as f32,
                 };
-                let tiles = layout::layout(&self.tree, key.root, rect, MIN_TILE_PX);
+                let tiles = layout::layout(&self.tree, &self.hidden, key.root, rect, MIN_TILE_PX);
                 let mut raster =
                     render::rasterize(&tiles, w, h, |t| self.palette.node(self.tree.node(t.id)));
                 let image =
@@ -596,7 +606,7 @@ impl Model {
                 self.selected = self.selected.and_then(|sel| match sel {
                     _ if self.tree.is_within(sel.node(), target) => None,
                     // Trashing a file shrinks its folder's (files) tile.
-                    Item::Files { dir, .. } => layout::items(&self.tree, dir)
+                    Item::Files { dir, .. } => layout::items(&self.tree, &self.hidden, dir)
                         .into_iter()
                         .find_map(|(item, _)| matches!(item, Item::Files { .. }).then_some(item)),
                     Item::Node(_) => Some(sel),
@@ -609,8 +619,8 @@ impl Model {
 }
 
 /// One hue per folder in the view root, by size rank.
-fn top_hues(tree: &Tree, root: NodeId) -> HashMap<NodeId, Rgb> {
-    layout::items(tree, root)
+fn top_hues(tree: &Tree, hidden: &Hidden, root: NodeId) -> HashMap<NodeId, Rgb> {
+    layout::items(tree, hidden, root)
         .into_iter()
         .filter_map(|(item, _)| match item {
             Item::Node(id) => Some(id),
@@ -623,8 +633,8 @@ fn top_hues(tree: &Tree, root: NodeId) -> HashMap<NodeId, Rgb> {
 
 /// Each tile takes the hue of its top-level ancestor, which in pre-order is
 /// the latest depth-1 tile.
-fn folder_fills(tree: &Tree, root: NodeId, tiles: &[FolderTile]) -> Vec<Rgb> {
-    let hues = top_hues(tree, root);
+fn folder_fills(tree: &Tree, hidden: &Hidden, root: NodeId, tiles: &[FolderTile]) -> Vec<Rgb> {
+    let hues = top_hues(tree, hidden, root);
     let mut hue = None;
     tiles
         .iter()

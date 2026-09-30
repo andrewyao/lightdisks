@@ -1,7 +1,11 @@
 use std::path::PathBuf;
 
+mod common;
+
+use common::{Spec, build, id, node};
+use lightdisks::hidden::Hidden;
 use lightdisks::layout::{FOLDER_PAD, FolderTile, Item, Rect, folders, items, layout, squarify};
-use lightdisks::tree::{ExtTable, Kind, Node, NodeId, Tree};
+use lightdisks::tree::{ExtTable, Kind, NodeId, Tree};
 
 fn rect(w: f32, h: f32) -> Rect {
     Rect {
@@ -112,15 +116,6 @@ fn equal_sizes_produce_near_square_tiles() {
     }
 }
 
-fn node(name: &str, parent: Option<u32>, size: u64, kind: Kind) -> Node {
-    Node {
-        name: name.into(),
-        parent: parent.map(NodeId),
-        size,
-        kind,
-    }
-}
-
 /// root/{a/{d.bin, e.bin}, b.txt, c.txt} where c.txt is far below one pixel.
 fn sample_tree() -> Tree {
     let mut exts = ExtTable::default();
@@ -151,7 +146,7 @@ fn layout_nests_children_inside_parents_and_drops_subpixel_tiles() {
         w: 100.0,
         h: 100.0,
     };
-    let tiles = layout(&tree, Tree::ROOT, bounds, 2.0);
+    let tiles = layout(&tree, &Hidden::default(), Tree::ROOT, bounds, 2.0);
 
     let ids: Vec<u32> = tiles.iter().map(|t| t.id.0).collect();
     assert_eq!(ids, vec![0, 1, 4, 5, 2], "pre-order without c.txt");
@@ -173,6 +168,7 @@ fn layout_skips_removed_nodes() {
     tree.remove(NodeId(4));
     let tiles = layout(
         &tree,
+        &Hidden::default(),
         Tree::ROOT,
         Rect {
             x: 0.0,
@@ -185,60 +181,6 @@ fn layout_skips_removed_nodes() {
     assert!(tiles.iter().all(|t| t.id != NodeId(4)));
     let e = tiles.iter().find(|t| t.id == NodeId(5)).unwrap();
     assert!((e.rect.area() - 100_000.0 / 500_000.0 * 10_000.0).abs() < 0.5);
-}
-
-enum Spec {
-    Dir(&'static str, Vec<Spec>),
-    File(&'static str, u64),
-    Link(&'static str, u64),
-}
-
-impl Spec {
-    fn size(&self) -> u64 {
-        match self {
-            Spec::Dir(_, kids) => kids.iter().map(Spec::size).sum(),
-            Spec::File(_, size) | Spec::Link(_, size) => *size,
-        }
-    }
-}
-
-/// Numbers `spec` breadth-first, as the scanner does, so every directory's
-/// children get one contiguous id range.
-fn build(spec: Spec) -> Tree {
-    let mut exts = ExtTable::default();
-    let ext = exts.intern("bin");
-    let mut nodes = Vec::new();
-    let mut queue = std::collections::VecDeque::from([(spec, None::<u32>)]);
-    let mut next = 1u32;
-    while let Some((spec, parent)) = queue.pop_front() {
-        let size = spec.size();
-        let (name, kind) = match spec {
-            Spec::Dir(name, kids) => {
-                let start = next;
-                next += kids.len() as u32;
-                let id = nodes.len() as u32;
-                queue.extend(kids.into_iter().map(|k| (k, Some(id))));
-                (
-                    name,
-                    Kind::Dir {
-                        children: start..next,
-                    },
-                )
-            }
-            Spec::File(name, _) => {
-                exts.bytes[ext.0 as usize] += size;
-                (name, Kind::File { ext })
-            }
-            Spec::Link(name, _) => (name, Kind::Other),
-        };
-        nodes.push(node(name, parent, size, kind));
-    }
-    Tree {
-        nodes,
-        exts,
-        root_path: PathBuf::from("/root"),
-        errors: 0,
-    }
 }
 
 /// root/{big/{x/{p, q}, y/{r}, s, link}, mid/{m}, dirs_only/{z/{t}},
@@ -269,11 +211,6 @@ fn folder_tree() -> Tree {
     ))
 }
 
-fn id(tree: &Tree, path: &str) -> NodeId {
-    path.split('/')
-        .fold(Tree::ROOT, |dir, name| tree.find_child(dir, name).unwrap())
-}
-
 const BIG: Rect = Rect {
     x: 5.0,
     y: 7.0,
@@ -294,7 +231,7 @@ fn parents(tiles: &[FolderTile]) -> Vec<Option<usize>> {
 fn folder_tiles_stop_at_max_depth() {
     let tree = folder_tree();
     for max_depth in 1..=4 {
-        let tiles = folders(&tree, Tree::ROOT, BIG, max_depth, 1.0);
+        let tiles = folders(&tree, &Hidden::default(), Tree::ROOT, BIG, max_depth, 1.0);
         assert!(
             tiles.iter().all(|t| (1..=max_depth).contains(&t.depth)),
             "max_depth {max_depth}: {:?}",
@@ -308,7 +245,7 @@ fn folder_tiles_stop_at_max_depth() {
             "a folder at max_depth {max_depth} was opened"
         );
     }
-    let deepest = folders(&tree, Tree::ROOT, BIG, 4, 1.0)
+    let deepest = folders(&tree, &Hidden::default(), Tree::ROOT, BIG, 4, 1.0)
         .iter()
         .map(|t| t.depth)
         .max();
@@ -318,7 +255,7 @@ fn folder_tiles_stop_at_max_depth() {
 #[test]
 fn folder_children_sit_inside_the_parent_below_its_header() {
     let tree = folder_tree();
-    let tiles = folders(&tree, Tree::ROOT, BIG, 4, 1.0);
+    let tiles = folders(&tree, &Hidden::default(), Tree::ROOT, BIG, 4, 1.0);
     let eps = 1e-2;
     for (tile, parent) in tiles.iter().zip(parents(&tiles)) {
         let r = tile.rect;
@@ -359,11 +296,11 @@ fn folder_children_sit_inside_the_parent_below_its_header() {
 #[test]
 fn sibling_folder_areas_are_proportional_to_their_bytes() {
     let tree = folder_tree();
-    let tiles = folders(&tree, Tree::ROOT, BIG, 4, 1.0);
+    let tiles = folders(&tree, &Hidden::default(), Tree::ROOT, BIG, 4, 1.0);
     let parents = parents(&tiles);
     let root_bytes = tree.node(Tree::ROOT).size as f32;
     for t in tiles.iter().filter(|t| t.depth == 1) {
-        let expected = BIG.area() * t.item.bytes(&tree) as f32 / root_bytes;
+        let expected = BIG.area() * t.item.bytes(&tree, &Hidden::default()) as f32 / root_bytes;
         assert!(
             (t.rect.area() - expected).abs() <= BIG.area() * 1e-4,
             "{:?}: area {}, expected {expected}",
@@ -377,8 +314,8 @@ fn sibling_folder_areas_are_proportional_to_their_bytes() {
             if parents[i] != parents[j] {
                 continue;
             }
-            let per_byte_a = a.rect.area() / a.item.bytes(&tree) as f32;
-            let per_byte_b = b.rect.area() / b.item.bytes(&tree) as f32;
+            let per_byte_a = a.rect.area() / a.item.bytes(&tree, &Hidden::default()) as f32;
+            let per_byte_b = b.rect.area() / b.item.bytes(&tree, &Hidden::default()) as f32;
             assert!(
                 (per_byte_a / per_byte_b - 1.0).abs() < 1e-3,
                 "{:?} and {:?} are not in proportion",
@@ -395,7 +332,7 @@ fn sibling_folder_areas_are_proportional_to_their_bytes() {
 fn a_files_tile_appears_exactly_when_a_folder_has_direct_files() {
     let mut tree = folder_tree();
     tree.remove(id(&tree, "solo/v"));
-    let tiles = folders(&tree, Tree::ROOT, BIG, 4, 0.0);
+    let tiles = folders(&tree, &Hidden::default(), Tree::ROOT, BIG, 4, 0.0);
 
     let files_of = |dir: NodeId| {
         let found: Vec<u64> = tiles
@@ -444,10 +381,10 @@ fn a_trashed_folder_gets_no_tile() {
     let mut tree = folder_tree();
     let mid = id(&tree, "mid");
     tree.remove(mid);
-    let tiles = folders(&tree, Tree::ROOT, BIG, 4, 0.0);
+    let tiles = folders(&tree, &Hidden::default(), Tree::ROOT, BIG, 4, 0.0);
     assert!(tiles.iter().all(|t| t.item != Item::Node(mid)));
     assert!(
-        items(&tree, Tree::ROOT)
+        items(&tree, &Hidden::default(), Tree::ROOT)
             .iter()
             .all(|&(item, _)| item != Item::Node(mid))
     );

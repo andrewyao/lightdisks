@@ -1,5 +1,6 @@
 use std::cmp::Reverse;
 
+use crate::hidden::Hidden;
 use crate::tree::{NodeId, Tree};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -33,7 +34,7 @@ const HEIGHT_FALLOFF: f32 = 0.91;
 /// after its parent and covers part of it. Children whose tile would be smaller
 /// than `min_px`² are dropped, and directories narrower than `min_px` are not
 /// opened.
-pub fn layout(tree: &Tree, root: NodeId, rect: Rect, min_px: f32) -> Vec<Tile> {
+pub fn layout(tree: &Tree, hidden: &Hidden, root: NodeId, rect: Rect, min_px: f32) -> Vec<Tile> {
     let mut cushion = [0.0; 4];
     add_ridges(&mut cushion, rect, ROOT_HEIGHT);
     let mut tiles = vec![Tile {
@@ -44,6 +45,7 @@ pub fn layout(tree: &Tree, root: NodeId, rect: Rect, min_px: f32) -> Vec<Tile> {
     }];
     lay_children(
         tree,
+        hidden,
         root,
         0,
         ROOT_HEIGHT * HEIGHT_FALLOFF,
@@ -55,6 +57,7 @@ pub fn layout(tree: &Tree, root: NodeId, rect: Rect, min_px: f32) -> Vec<Tile> {
 
 fn lay_children(
     tree: &Tree,
+    hidden: &Hidden,
     dir: NodeId,
     parent: usize,
     height: f32,
@@ -67,14 +70,17 @@ fn lay_children(
         depth,
         ..
     } = tiles[parent].clone();
-    let total = tree.node(dir).size;
+    let total = hidden.size(tree, dir);
     if total == 0 {
         return;
     }
     let px_per_byte = rect.area() as f64 / total as f64;
     let min_area = (min_px * min_px) as f64;
 
-    let mut kids: Vec<(NodeId, u64)> = tree.children(dir).map(|c| (c, tree.node(c).size)).collect();
+    let mut kids: Vec<(NodeId, u64)> = tree
+        .children(dir)
+        .map(|c| (c, hidden.size(tree, c)))
+        .collect();
     // Trashing shrinks ancestors after the scan sorted them, so re-sort here.
     kids.sort_by_key(|&(_, size)| Reverse(size));
     let visible = kids.partition_point(|&(_, size)| size as f64 * px_per_byte >= min_area);
@@ -92,7 +98,15 @@ fn lay_children(
         });
         if tree.is_dir(id) && r.w >= min_px && r.h >= min_px {
             let index = tiles.len() - 1;
-            lay_children(tree, id, index, height * HEIGHT_FALLOFF, min_px, tiles);
+            lay_children(
+                tree,
+                hidden,
+                id,
+                index,
+                height * HEIGHT_FALLOFF,
+                min_px,
+                tiles,
+            );
         }
     }
 }
@@ -204,9 +218,9 @@ pub enum Item {
 }
 
 impl Item {
-    pub fn bytes(&self, tree: &Tree) -> u64 {
+    pub fn bytes(&self, tree: &Tree, hidden: &Hidden) -> u64 {
         match *self {
-            Item::Node(id) => tree.node(id).size,
+            Item::Node(id) => hidden.size(tree, id),
             Item::Files { bytes, .. } => bytes,
         }
     }
@@ -236,11 +250,11 @@ const MIN_OPEN_H: f32 = FOLDER_HEADER + 20.0;
 
 /// The subfolders of `dir`, plus one `Item::Files` for everything else in it,
 /// sorted by size descending. Empty (trashed) entries are left out.
-pub fn items(tree: &Tree, dir: NodeId) -> Vec<(Item, u64)> {
+pub fn items(tree: &Tree, hidden: &Hidden, dir: NodeId) -> Vec<(Item, u64)> {
     let mut files = 0;
     let mut out = Vec::new();
     for c in tree.children(dir) {
-        let size = tree.node(c).size;
+        let size = hidden.size(tree, c);
         if size == 0 {
             continue;
         }
@@ -261,58 +275,66 @@ pub fn items(tree: &Tree, dir: NodeId) -> Vec<(Item, u64)> {
 /// down to at most `max_depth`. Items smaller than `min_px`² are dropped.
 pub fn folders(
     tree: &Tree,
+    hidden: &Hidden,
     root: NodeId,
     rect: Rect,
     max_depth: u8,
     min_px: f32,
 ) -> Vec<FolderTile> {
     let mut tiles = Vec::new();
-    lay_folder(tree, root, rect, 1, max_depth, min_px, &mut tiles);
+    let folders = FolderLayout {
+        tree,
+        hidden,
+        max_depth,
+        min_px,
+    };
+    folders.lay(root, rect, 1, &mut tiles);
     tiles
 }
 
-fn lay_folder(
-    tree: &Tree,
-    dir: NodeId,
-    rect: Rect,
-    depth: u8,
+struct FolderLayout<'a> {
+    tree: &'a Tree,
+    hidden: &'a Hidden,
     max_depth: u8,
     min_px: f32,
-    tiles: &mut Vec<FolderTile>,
-) {
-    let mut items = items(tree, dir);
-    let total: u64 = items.iter().map(|&(_, size)| size).sum();
-    if total == 0 {
-        return;
-    }
-    let px_per_byte = rect.area() as f64 / total as f64;
-    let min_area = (min_px * min_px) as f64;
-    items.retain(|&(_, size)| size as f64 * px_per_byte >= min_area);
+}
 
-    let sizes: Vec<u64> = items.iter().map(|&(_, size)| size).collect();
-    for ((item, _), r) in items.into_iter().zip(squarify(&sizes, total, rect)) {
-        let open = depth < max_depth && r.w >= MIN_OPEN_W && r.h >= MIN_OPEN_H;
-        let opened = match item {
-            Item::Node(id) if open => Some(id),
-            _ => None,
-        };
-        tiles.push(FolderTile {
-            item,
-            rect: r,
-            header: opened.map(|_| Rect {
-                h: FOLDER_HEADER,
-                ..r
-            }),
-            depth,
-        });
-        if let Some(id) = opened {
-            let content = Rect {
-                x: r.x + FOLDER_PAD,
-                y: r.y + FOLDER_HEADER,
-                w: r.w - 2.0 * FOLDER_PAD,
-                h: r.h - FOLDER_HEADER - FOLDER_PAD,
+impl FolderLayout<'_> {
+    fn lay(&self, dir: NodeId, rect: Rect, depth: u8, tiles: &mut Vec<FolderTile>) {
+        let mut items = items(self.tree, self.hidden, dir);
+        let total: u64 = items.iter().map(|&(_, size)| size).sum();
+        if total == 0 {
+            return;
+        }
+        let px_per_byte = rect.area() as f64 / total as f64;
+        let min_area = (self.min_px * self.min_px) as f64;
+        items.retain(|&(_, size)| size as f64 * px_per_byte >= min_area);
+
+        let sizes: Vec<u64> = items.iter().map(|&(_, size)| size).collect();
+        for ((item, _), r) in items.into_iter().zip(squarify(&sizes, total, rect)) {
+            let open = depth < self.max_depth && r.w >= MIN_OPEN_W && r.h >= MIN_OPEN_H;
+            let opened = match item {
+                Item::Node(id) if open => Some(id),
+                _ => None,
             };
-            lay_folder(tree, id, content, depth + 1, max_depth, min_px, tiles);
+            tiles.push(FolderTile {
+                item,
+                rect: r,
+                header: opened.map(|_| Rect {
+                    h: FOLDER_HEADER,
+                    ..r
+                }),
+                depth,
+            });
+            if let Some(id) = opened {
+                let content = Rect {
+                    x: r.x + FOLDER_PAD,
+                    y: r.y + FOLDER_HEADER,
+                    w: r.w - 2.0 * FOLDER_PAD,
+                    h: r.h - FOLDER_HEADER - FOLDER_PAD,
+                };
+                self.lay(id, content, depth + 1, tiles);
+            }
         }
     }
 }

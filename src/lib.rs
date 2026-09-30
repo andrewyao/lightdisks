@@ -1,5 +1,6 @@
 pub mod app;
 pub mod color;
+pub mod hidden;
 pub mod layout;
 pub mod render;
 pub mod scan;
