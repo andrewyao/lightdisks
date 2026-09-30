@@ -194,3 +194,125 @@ fn worst_ratio(sum: f64, lo: f64, hi: f64, side: f64) -> f64 {
     let sum2 = sum * sum;
     (side2 * hi / sum2).max(sum2 / (side2 * lo))
 }
+
+/// What a folder-view tile stands for: a folder, or the direct files of `dir`
+/// merged into one tile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Item {
+    Node(NodeId),
+    Files { dir: NodeId, bytes: u64 },
+}
+
+impl Item {
+    pub fn bytes(&self, tree: &Tree) -> u64 {
+        match *self {
+            Item::Node(id) => tree.node(id).size,
+            Item::Files { bytes, .. } => bytes,
+        }
+    }
+
+    /// The folder itself, or the folder holding the files.
+    pub fn node(&self) -> NodeId {
+        match *self {
+            Item::Node(id) | Item::Files { dir: id, .. } => id,
+        }
+    }
+}
+
+/// One folder-view tile. An opened folder has a `header` strip for its name,
+/// and its children fill the rest of `rect`, inset by `FOLDER_PAD`.
+#[derive(Clone, Debug)]
+pub struct FolderTile {
+    pub item: Item,
+    pub rect: Rect,
+    pub header: Option<Rect>,
+    pub depth: u8,
+}
+
+pub const FOLDER_HEADER: f32 = 18.0;
+pub const FOLDER_PAD: f32 = 2.0;
+const MIN_OPEN_W: f32 = 40.0;
+const MIN_OPEN_H: f32 = FOLDER_HEADER + 20.0;
+
+/// The subfolders of `dir`, plus one `Item::Files` for everything else in it,
+/// sorted by size descending. Empty (trashed) entries are left out.
+pub fn items(tree: &Tree, dir: NodeId) -> Vec<(Item, u64)> {
+    let mut files = 0;
+    let mut out = Vec::new();
+    for c in tree.children(dir) {
+        let size = tree.node(c).size;
+        if size == 0 {
+            continue;
+        }
+        if tree.is_dir(c) {
+            out.push((Item::Node(c), size));
+        } else {
+            files += size;
+        }
+    }
+    if files > 0 {
+        out.push((Item::Files { dir, bytes: files }, files));
+    }
+    out.sort_by_key(|&(_, size)| Reverse(size));
+    out
+}
+
+/// Folder tiles below `root` in pre-order, from depth 1 (the items of `root`)
+/// down to at most `max_depth`. Items smaller than `min_px`² are dropped.
+pub fn folders(
+    tree: &Tree,
+    root: NodeId,
+    rect: Rect,
+    max_depth: u8,
+    min_px: f32,
+) -> Vec<FolderTile> {
+    let mut tiles = Vec::new();
+    lay_folder(tree, root, rect, 1, max_depth, min_px, &mut tiles);
+    tiles
+}
+
+fn lay_folder(
+    tree: &Tree,
+    dir: NodeId,
+    rect: Rect,
+    depth: u8,
+    max_depth: u8,
+    min_px: f32,
+    tiles: &mut Vec<FolderTile>,
+) {
+    let mut items = items(tree, dir);
+    let total: u64 = items.iter().map(|&(_, size)| size).sum();
+    if total == 0 {
+        return;
+    }
+    let px_per_byte = rect.area() as f64 / total as f64;
+    let min_area = (min_px * min_px) as f64;
+    items.retain(|&(_, size)| size as f64 * px_per_byte >= min_area);
+
+    let sizes: Vec<u64> = items.iter().map(|&(_, size)| size).collect();
+    for ((item, _), r) in items.into_iter().zip(squarify(&sizes, total, rect)) {
+        let open = depth < max_depth && r.w >= MIN_OPEN_W && r.h >= MIN_OPEN_H;
+        let opened = match item {
+            Item::Node(id) if open => Some(id),
+            _ => None,
+        };
+        tiles.push(FolderTile {
+            item,
+            rect: r,
+            header: opened.map(|_| Rect {
+                h: FOLDER_HEADER,
+                ..r
+            }),
+            depth,
+        });
+        if let Some(id) = opened {
+            let content = Rect {
+                x: r.x + FOLDER_PAD,
+                y: r.y + FOLDER_HEADER,
+                w: r.w - 2.0 * FOLDER_PAD,
+                h: r.h - FOLDER_HEADER - FOLDER_PAD,
+            };
+            lay_folder(tree, id, content, depth + 1, max_depth, min_px, tiles);
+        }
+    }
+}
