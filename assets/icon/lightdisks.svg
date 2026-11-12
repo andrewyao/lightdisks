@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- LightDisks app icon: a disk-usage treemap lit by a beam of warm light,
+       sibling to LightPhotos' frame-and-beam icon.
+       Drawn on Apple's 1024 px macOS icon grid (824 px tile, 100 px margin). -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#363a42"/>
+      <stop offset="1" stop-color="#15171b"/>
+    </linearGradient>
+    <linearGradient id="beam" gradientUnits="userSpaceOnUse" x1="820" y1="190" x2="260" y2="820">
+      <stop offset="0" stop-color="#ffd27a"/>
+      <stop offset="0.45" stop-color="#ff9a3c" stop-opacity="0.85"/>
+      <stop offset="1" stop-color="#ff6a3d" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="sun" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#fff6dc"/>
+      <stop offset="0.55" stop-color="#ffd27a"/>
+      <stop offset="1" stop-color="#ffb347" stop-opacity="0"/>
+    </radialGradient>
+    <clipPath id="tileClip">
+      <rect x="100" y="100" width="824" height="824" rx="185"/>
+    </clipPath>
+    <!-- the treemap: one big folder on the left, smaller ones stacked on the right -->
+    <clipPath id="cells">
+      <rect x="230" y="230" width="330" height="370" rx="28"/>
+      <rect x="230" y="624" width="330" height="170" rx="28"/>
+      <rect x="584" y="230" width="210" height="250" rx="28"/>
+      <rect x="584" y="504" width="210" height="150" rx="28"/>
+      <rect x="584" y="678" width="93" height="116" rx="22"/>
+      <rect x="701" y="678" width="93" height="116" rx="22"/>
+    </clipPath>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="125%">
+      <feDropShadow dx="0" dy="10" stdDeviation="10" flood-color="#000" flood-opacity="0.3"/>
+    </filter>
+  </defs>
+
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#tile)" filter="url(#shadow)"/>
+
+  <!-- unlit cells -->
+  <g clip-path="url(#cells)">
+    <rect x="200" y="200" width="624" height="624" fill="#f4f1ea" fill-opacity="0.14"/>
+  </g>
+
+  <g clip-path="url(#tileClip)">
+    <!-- the beam: narrow at the light source, widening as it falls across the tile -->
+    <polygon points="770,190 850,262 430,960 120,690" fill="url(#beam)" fill-opacity="0.35"/>
+    <circle cx="790" cy="235" r="120" fill="url(#sun)"/>
+  </g>
+
+  <!-- where the beam falls across the treemap, the cells light up -->
+  <g clip-path="url(#cells)">
+    <polygon points="770,190 850,262 430,960 120,690" fill="url(#beam)"/>
+  </g>
+</svg>
